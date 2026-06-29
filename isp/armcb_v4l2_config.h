@@ -82,6 +82,7 @@ int armcb_init_output_addr_by_i7(uint32_t *p_vout_reg1,
                                     uint32_t *p_vout_reg2, int vout);
 void armcb_i7_disable_int(void);
 void armcb_i7_disable_vin(void);
+void armcb_i7_disable_interrupt(void);
 int destroy_buf_queue(struct vb2_queue *q, enum vb2_buffer_state state);
 int armcb_get_output_addr_by_outport_i7(uint32_t outport,
 		uint32_t *p_vout_reg1, uint32_t *p_vout_reg2);

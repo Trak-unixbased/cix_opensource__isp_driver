@@ -23,6 +23,7 @@
 #include "armcb_v4l2_stream.h"
 #include "armcb_v4l_sd.h"
 #include "armcb_vb2.h"
+#include "armcb_isp_execstart.h"
 #include "asm-generic/errno-base.h"
 #include "isp_hw_ops.h"
 #include "linux/types.h"
@@ -34,6 +35,7 @@
 #include <linux/font.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
@@ -491,6 +493,7 @@ static int armcb_v4l2_fh_release(struct file *file)
 {
 	struct armcb_isp_v4l2_fh *sp = fh_to_private(file->private_data);
 	armcb_v4l2_dev_t *dev = video_drvdata(file);
+	struct video_device *vdev = &dev->vid_cap_dev;
 	struct v4l2_event_subscription sub;
 	int ret = 0;
 
@@ -503,20 +506,34 @@ static int armcb_v4l2_fh_release(struct file *file)
 		ret = v4l2_event_unsubscribe(&sp->fh, &sub);
 		LOG(LOG_DEBUG,
 				"armcb_fop_release v4l2_event_unsubscribe, ret = %d", ret);
+		/* Release vb2 queue on close. When vdev->queue==NULL: if s_ctrl
+		 * already released (queue_released_by_s_ctrl), skip to avoid double-release;
+		 * else release our queue to avoid leak when vdev->queue was wrongly set null. */
+		mutex_lock(&dev->queue_lock);
+		if (sp->vb2_q.dev) {
+			if (vdev->queue == &sp->vb2_q) {
+				vdev->queue = NULL;
+				dev->queue_released_by_s_ctrl = 0;
+				vb2_queue_release(&sp->vb2_q);
+			} else if (vdev->queue != NULL) {
+				dev->queue_released_by_s_ctrl = 0;
+				vb2_queue_release(&sp->vb2_q); /* not owner, release our queue */
+			} else {
+				/* vdev->queue == NULL */
+				if (dev->queue_released_by_s_ctrl) {
+					dev->queue_released_by_s_ctrl = 0; /* already released by s_ctrl, skip */
+				} else {
+					/* Abnormal: queue never released, avoid leak */
+					vb2_queue_release(&sp->vb2_q);
+					dev->queue_released_by_s_ctrl = 0;
+				}
+			}
+		}
+		mutex_unlock(&dev->queue_lock);
 		v4l2_fh_del(&sp->fh);
 		v4l2_fh_exit(&sp->fh);
 		kfree(sp);
 	}
-
-	return ret;
-}
-
-int armcb_disable_irq(void)
-{
-	int ret = 0;
-
-	armcb_i7_disable_int();
-	armcb_i7_disable_vin();
 
 	return ret;
 }
@@ -595,6 +612,28 @@ static int armcb_v4l2_post_streamoff_event(armcb_v4l2_dev_t *dev)
 	return 0;
 }
 
+/**
+ * Release one stream slot: clear g_outport_map, stream_id_index, deinit stream,
+ * clear pstreams[stream_id] and stream_mask. Caller must hold dev->queue_lock.
+ */
+static void armcb_v4l2_release_stream_slot(armcb_v4l2_dev_t *dev, int stream_id)
+{
+	armcb_v4l2_stream_t *pstream = dev->pstreams[stream_id];
+	int outport_idx;
+
+	if (!pstream)
+		return;
+	outport_idx = armcb_outport_bits_to_idx(pstream->outport);
+	if (outport_idx >= 0 && outport_idx < ISP_OUTPUT_PORT_MAX)
+		g_outport_map[dev->ctx_id][outport_idx] = NULL;
+	if (pstream->stream_type < V4L2_STREAM_TYPE_MAX)
+		dev->stream_id_index[pstream->stream_type] = -1;
+	armcb_v4l2_stream_deinit(pstream, dev);
+	dev->pstreams[stream_id] = NULL;
+	dev->stream_mask &= ~(1 << stream_id);
+	dev->is_streaming = 0;
+}
+
 static int armcb_v4l2_fop_release(struct file *file)
 {
 	armcb_v4l2_dev_t *dev = video_drvdata(file);
@@ -631,7 +670,7 @@ static int armcb_v4l2_fop_release(struct file *file)
 			/* The isp_app open the video node twice, and the v4l2 app
 			 * open the video node once, so if the really close, there
 			 * should left 3 times for close the fd */
-			if (rc > MAX_DEV_OPEN_NUM)
+			if ((rc > MAX_DEV_OPEN_NUM) && (dev->online_mode))
 				goto exit;
 
 			rc = armcb_v4l2_post_streamoff_event(dev);
@@ -646,13 +685,33 @@ static int armcb_v4l2_fop_release(struct file *file)
 				rc = atomic_read(&dev->opened);
 				LOG(LOG_DEBUG, "%s fd num_cnt: %d \n",
 						dev_name(&vdev->dev), rc);
-				if (rc > MAX_DEV_OPEN_NUM)
+				if ((rc > MAX_DEV_OPEN_NUM) && (dev->online_mode))
 					goto exit;
 
 				rc = armcb_v4l2_post_streamoff_event(dev);
 			}
 		}
 
+		/* Point only this stream's output to discard buffer to avoid SMMU errors.
+		 * Do not call armcb_v4l2_config_init_update_stream_hw_addr(dev) here:
+		 * that updates all vout ports and would break the other camera's stream. */
+		if (pstream && pstream->outport && discard_buf_addr_dma) {
+			u32 vout_r1 = 0, vout_r2 = 0;
+
+			if (armcb_get_output_addr_by_outport_i7(pstream->outport,
+								&vout_r1, &vout_r2) >= 0) {
+				if (vout_r1)
+					armcb_isp_write_reg(vout_r1, discard_buf_addr_dma);
+				if (vout_r2)
+					armcb_isp_write_reg(vout_r2, discard_buf_addr_dma);
+			}
+		}
+		/* Clear this stream's state so the next open (e.g. gstreamer re-enter)
+		 * can succeed: otherwise stream_mask / g_outport_map stay set and
+		 * s_fmt fails with outport busy or wrong stream reuse. */
+		mutex_lock(&dev->queue_lock);
+		armcb_v4l2_release_stream_slot(dev, sp->stream_id);
+		mutex_unlock(&dev->queue_lock);
 		goto exit;
 	}
 
@@ -677,26 +736,22 @@ static int armcb_v4l2_fop_release(struct file *file)
 
 		if(dev->buf_type == q->type) {
 			LOG(LOG_DEBUG, " ##### %s, vb2 release\n", dev_name(&vdev->dev));
-			rc = destroy_buf_queue(q, VB2_BUF_STATE_ERROR);
-			if(!rc) {
-				mutex_lock(&dev->queue_lock);
+			mutex_lock(&dev->queue_lock);
+			/* Always stop queue before release to avoid __vb2_queue_cancel WARNING */
+			rc = vb2_streamoff(q, q->type);
+			if (rc == 0) {
+				armcb_v4l2_stream_clear_buffer_lists(pstream);
+			} else {
+				rc = destroy_buf_queue(q, VB2_BUF_STATE_ERROR);
+			}
+			if (!rc) {
 				vb2_queue_release(q);
 				vdev->queue = NULL;
-				mutex_unlock(&dev->queue_lock);
+				dev->queue_released_by_s_ctrl = 1; /* so fh_release skips, avoid double-release */
 			}
-			dev->stream_mask &= ~(1 << sp->stream_id);
-			/* deinit stream */
-			if (pstream) {
-				outport_idx = armcb_outport_bits_to_idx(pstream->outport);
-				if (outport_idx >= 0 && outport_idx < ISP_OUTPUT_PORT_MAX)
-					g_outport_map[sp->ctx_id][outport_idx] = NULL;
-				if (pstream->stream_type < V4L2_STREAM_TYPE_MAX)
-					dev->stream_id_index[pstream->stream_type] = -1;
-				armcb_v4l2_stream_deinit(pstream, dev);
-				dev->pstreams[sp->stream_id] = NULL;
-			}
-			/*deinit the stream*/
-			dev->is_streaming = 0;
+
+			armcb_v4l2_release_stream_slot(dev, sp->stream_id);
+			mutex_unlock(&dev->queue_lock);
 			goto deinit;
 		}
 	}
@@ -722,6 +777,8 @@ static int armcb_v4l2_fop_release(struct file *file)
 	}
 
 	armcb_v4l2_fh_release(file);
+	if (dev->ctx_id == 0)
+		armcb_isp_execstart_note_ctx0_release();
 	LOG(LOG_INFO, "release v4l2 fp success");
 	return rc;
 
@@ -733,6 +790,8 @@ deinit:
 exit:
 	/* release file handle */
 	armcb_v4l2_fh_release(file);
+	if (dev->ctx_id == 0)
+		armcb_isp_execstart_note_ctx0_release();
 	LOG(LOG_INFO, "release v4l2 fp success");
 	return rc;
 }
@@ -806,6 +865,24 @@ static int armcb_v4l2_fop_open(struct file *filp)
 	}
 
 normal_mode:
+	/*
+	 * Newest running isp_app cmdline -> allowed armcb_isp_v4l2-00..03 (ctx_id).
+	 * Multi-camera (-m 2/3/4): open -00 before other nodes.
+	 */
+	armcb_isp_execstart_refresh_if_needed();
+	if (!armcb_isp_execstart_ctx_allowed(dev->ctx_id)) {
+		LOG(LOG_ERR,
+		    "%s: camera is not support (isp_app cmdline policy, ctx_id=%u)\n",
+		    dev_name(&vdev->dev), dev->ctx_id);
+		return -EPERM;
+	}
+	if (!armcb_isp_execstart_multi_open_order_ok(dev->ctx_id)) {
+		LOG(LOG_ERR,
+		    "%s: camera is not support (open armcb_isp_v4l2-00 first, multi-camera)\n",
+		    dev_name(&vdev->dev));
+		return -EPERM;
+	}
+
 	ret = armcb_v4l2_fh_open(filp);
 	if (ret < 0) {
 		LOG(LOG_ERR, "Error, file handle open fail (rc=%d)", ret);
@@ -813,6 +890,8 @@ normal_mode:
 	}
 
 	atomic_add(1, &dev->opened);
+	if (dev->ctx_id == 0)
+		armcb_isp_execstart_note_ctx0_open();
 
 open_fail:
 	return ret;
@@ -1097,7 +1176,7 @@ static int armcb_isp_vb2_streamoff(struct file *file)
 {
 	armcb_v4l2_dev_t *dev = video_drvdata(file);
 	struct video_device *vdev = &dev->vid_cap_dev;
-	struct vb2_queue *q = vdev->queue;
+	struct vb2_queue *q;
 	struct armcb_isp_v4l2_fh *sp = fh_to_private(file->private_data);
 	armcb_v4l2_stream_t *pstream = dev->pstreams[sp->stream_id];
 	int outport_idx = -1;
@@ -1105,6 +1184,8 @@ static int armcb_isp_vb2_streamoff(struct file *file)
 	int ret = 0;
 
 	mutex_lock(&dev->queue_lock);
+	/* Read queue under lock so we don't use a stale pointer if close() already released it. */
+	q = vdev->queue;
 
 	if (!pstream) {
 		dev->is_streaming = 0;
@@ -1120,24 +1201,39 @@ static int armcb_isp_vb2_streamoff(struct file *file)
 
 	pstream->stream_started = 0;
 
-	/* Check isp_app stream off the isp hardware, then release the buffer*/
-	if((atomic_read(&dev->stream_on_cnt) == STREAM_ON) && (vdev->queue))
-	{
-		/* Revert the dev->stream_on_cnt to -1 for check the isp_app
-		 * streamon/off status, the file->private_data shoule be the
-		 * vdev->queue->owner, if not, the vb2_fos_release will not call
-		 * vb2_queue_release. So the V4L2 alloc buffer release by isp_app
-		 * need to use vb2_queue_release buffer to avoid this issue.*/
-		if(dev->buf_type == q->type) {
+	/* s_ctrl(STREAM_OFF) calls this when queue exists (do_vb2). Always run streamoff
+	 * and release so that if the app (e.g. gstreamer) never closes or crashes,
+	 * isp_app can release the queue and avoid leak. fh_release will skip when
+	 * queue_released_by_s_ctrl is set. */
+	if ((atomic_read(&dev->stream_on_cnt) == STREAM_ON) && (vdev->queue) &&
+	    (dev->buf_type == q->type)) {
 			/* destroy buf queue*/
 			if (!dev->is_streaming) //stream is release.
 				goto exit;
 
-			ret = destroy_buf_queue(q, VB2_BUF_STATE_ERROR);
-			if(!ret) {
+			/* Always stop vb2 queue before release to avoid __vb2_queue_cancel WARNING
+			 * (queue must leave streaming state before vb2_queue_release).
+			 * vb2_streamoff is safe when not streaming (returns -EINVAL, we still release). */
+			ret = vb2_streamoff(q, q->type);
+			if (ret == 0) {
+				/* Buffers already completed by vb2_streamoff; clear driver lists
+				 * without calling vb2_buffer_done again. */
+				armcb_v4l2_stream_clear_buffer_lists(pstream);
+			} else {
+				/* Not streaming or streamoff failed (e.g. -EBUSY owner mismatch):
+				 * complete buffers then release; may trigger __vb2_queue_cancel WARNING
+				 * if queue was still streaming. Ensure same fd does STREAMON and s_ctrl(STREAM_OFF). */
+				if (ret != -EINVAL)
+					LOG(LOG_ERR, "vb2_streamoff failed %d (owner?); release may WARN\n", ret);
+				ret = destroy_buf_queue(q, VB2_BUF_STATE_ERROR);
+			}
+			if (!ret && vdev->queue == q) {
+				/* Always release so leak is avoided if the app never closes (e.g. crash).
+				 * fh_release will skip when queue_released_by_s_ctrl is set. */
 				LOG(LOG_INFO, " ##### %s, vb2 release\n", dev_name(&vdev->dev));
-				vb2_queue_release(q);
 				vdev->queue = NULL;
+				dev->queue_released_by_s_ctrl = 1;
+				vb2_queue_release(q);
 			}
 
 			if (dev->ddr_lp_mode == 0) {
@@ -1145,26 +1241,10 @@ static int armcb_isp_vb2_streamoff(struct file *file)
 				dev->ddr_lp_mode = 1;
 				usleep_range(100,100 + 100);
 			}
-		}
 
-		/*deinit the stream*/
-		for(loop = 0;loop < V4L2_STREAM_TYPE_MAX;loop++) {
-			armcb_v4l2_stream_t *pstream = dev->pstreams[loop];
-			if(pstream != NULL) {
-				dev->stream_mask &= ~(1 << loop);
-				/* deinit stream */
-				if (pstream) {
-					outport_idx = armcb_outport_bits_to_idx(pstream->outport);
-					if (outport_idx >= 0 && outport_idx < ISP_OUTPUT_PORT_MAX)
-						g_outport_map[dev->ctx_id][outport_idx] = NULL;
-					if (pstream->stream_type < V4L2_STREAM_TYPE_MAX)
-						dev->stream_id_index[pstream->stream_type] = -1;
-					armcb_v4l2_stream_deinit(pstream, dev);
-					dev->pstreams[loop] = NULL;
-					dev->is_streaming = 0;
-				}
-			}
-		}
+		/* deinit all stream slots */
+		for (loop = 0; loop < V4L2_STREAM_TYPE_MAX; loop++)
+			armcb_v4l2_release_stream_slot(dev, loop);
 	}
 
 exit:
@@ -1563,20 +1643,32 @@ static int armcb_v4l2_s_ctrl(struct file *file, void *fh,
 
 	switch (ctrl->id) {
 		case ISP_DAEMON_SET_STREAM_ON:
-			LOG(LOG_INFO, "devname:%s, ISP_DAEMON_SET_STREAM_ON\n",
-					dev_name(&vdev->dev));
-			/* Just frist time and frist few frame use reserved buffer*/
-			armcb_v4l2_config_init_update_stream_hw_addr(dev);
-
-			rc = armcb_isp_hw_apply_list(CMD_TYPE_STREAMON);
-			atomic_set(&dev->stream_on_cnt, STREAM_ON);
-			if (rc < 0) {
-				LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
+			LOG(LOG_INFO, "devname:%s online_mode:%d, ISP_DAEMON_SET_STREAM_ON\n",
+					dev_name(&vdev->dev), ctrl->value);
+			dev->online_mode = ctrl->value;
+			if (ctrl->value) {
+				/* Live sensor: discard buffers on vout until app queues real buffers */
+				armcb_v4l2_config_init_update_stream_hw_addr(dev);
+				rc = armcb_isp_hw_apply_list(CMD_TYPE_STREAMON);
+				if (rc < 0) {
+					LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
+				} else {
+					LOG(LOG_INFO, "pstream:%p, armcb_isp_hw_apply_list success",
+							pstream);
+				}
+				atomic_set(&dev->stream_on_cnt, STREAM_ON);
+			} else if (armcb_multi_cam) {
+				/* Multi-cam only: offline ctx wakes GStreamer without touching all VOUTs */
+				rc = 0;
+				atomic_set(&dev->stream_on_cnt, STREAM_ON);
 			} else {
-				LOG(LOG_INFO, "pstream:%p, armcb_isp_hw_apply_list success",
-						pstream);
+				/* Single-cam: preserve legacy offline STREAMON path */
+				armcb_v4l2_config_init_update_stream_hw_addr(dev);
+				rc = armcb_isp_hw_apply_list(CMD_TYPE_STREAMON);
+				atomic_set(&dev->stream_on_cnt, STREAM_ON);
+				if (rc < 0)
+					LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
 			}
-			/* Set the streamon done flag to wake the streamon queue */
 			dev->streamon_done = 1;
 			dev->streamoff_done = 0;
 			wake_up_interruptible(&dev->wait_streamon_queue);
@@ -1593,11 +1685,28 @@ static int armcb_v4l2_s_ctrl(struct file *file, void *fh,
 			LOG(LOG_INFO,"set the multi camera %d", armcb_multi_cam);
 			rc = 0;
 			break;
-		case ISP_DAEMON_SET_STREAM_OFF:
-			LOG(LOG_INFO, "devname:%s, ISP_DAEMON_SET_STREAM_OFF\n",
+		case ISP_DAEMON_SET_STREAM_OFF: {
+			struct vb2_queue *q_stop;
+			bool do_vb2 = false;
+
+			LOG(LOG_INFO, "ISP_DAEMON_SET_STREAM_OFF enter, devname:%s\n",
 					dev_name(&vdev->dev));
-			/*disbale the stream operate ram,if not smmu error maybe occur */
-			armcb_disable_irq();
+			/* Only isp_app calls this. If the queue (e.g. applied by gstreamer) is not yet
+			 * released, run vb2_streamoff/release here; if already released (queue is null),
+			 * skip vb2. armcb_isp_vb2_streamoff internally checks owner and only releases
+			 * when appropriate. Hardware streamoff is always run. */
+			mutex_lock(&dev->queue_lock);
+			q_stop = vdev->queue;
+			do_vb2 = (q_stop != NULL);
+			if (!q_stop)
+				LOG(LOG_INFO, "ISP_DAEMON_SET_STREAM_OFF: queue already released, hw streamoff only, skip vb2\n");
+			else
+				LOG(LOG_INFO, "ISP_DAEMON_SET_STREAM_OFF: queue not released yet, run hw streamoff + vb2 release\n");
+			mutex_unlock(&dev->queue_lock);
+
+			/* Always do hardware streamoff so that ISP is powered down. */
+			LOG(LOG_INFO, "ISP_DAEMON_SET_STREAM_OFF: run hardware streamoff (disable_irq, STREAMOFF, POWERDOWN)\n");
+			armcb_i7_disable_interrupt();
 			rc = armcb_isp_hw_apply_list(CMD_TYPE_STREAMOFF);
 			if (rc < 0) {
 				LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
@@ -1609,14 +1718,20 @@ static int armcb_v4l2_s_ctrl(struct file *file, void *fh,
 				LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
 				return rc;
 			}
-			armcb_isp_vb2_streamoff(file);
+			/* Wait for hardware to complete any in-flight DMA transactions. */
+			usleep_range(50000, 55000);
+			LOG(LOG_INFO, "Hardware streamoff/powerdown completed");
+			if (do_vb2) {
+				armcb_isp_vb2_streamoff(file);
+				LOG(LOG_INFO, "ISP_DAEMON_SET_STREAM_OFF: vb2 streamoff done\n");
+			}
 			atomic_set(&dev->stream_on_cnt, STREAM_OFF);
-			/* Set the streamon done flag to wake the streamoff queue */
 			atomic_set(&dev->port_idx_release, OUTPORT_IDX_IS_BUSY);
 			dev->streamoff_done = 1;
 			dev->streamon_done = 0;
 			wake_up_interruptible(&dev->wait_streamoff_queue);
 			break;
+		}
 		case ISP_DAEMON_SET_EXIT:
 			LOG(LOG_INFO, "devname:%s, ISP_DAEMON_SET_EXIT",
 						dev_name(&vdev->dev));

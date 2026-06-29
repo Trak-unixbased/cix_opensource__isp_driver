@@ -137,6 +137,7 @@ armcb_async_notifier_add_devname_subdev(struct v4l2_async_notifier *notifier,
 	asd = v4l2_async_nf_add_fwnode(notifier, fwnode, typeof(*asd));
 	if (IS_ERR(asd)) {
 		LOG(LOG_ERR, "fail to add asd = %p\n", asd);
+		fwnode_handle_put(priv);
 		return PTR_ERR(asd);
 	}
 

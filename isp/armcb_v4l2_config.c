@@ -24,6 +24,7 @@
 #include <linux/vmalloc.h>
 #include <linux/font.h>
 #include <linux/mutex.h>
+#include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/videodev2.h>
 #include <linux/v4l2-dv-timings.h>
@@ -1075,6 +1076,13 @@ void armcb_i7_disable_vin(void)
 #define VIN_VIN_REG_40_ADDR (0x40)
 	/*mask input & output*/
 	armcb_isp_write_reg(I7_VIN_BASE_ADDR + VIN_VIN_REG_40_ADDR, 0x3<<7 | 0x4);
+}
+
+void armcb_i7_disable_interrupt(void)
+{
+	armcb_i7_disable_int();
+	armcb_i7_disable_vin();
+	usleep_range(50000, 55000);
 }
 
 static inline void armcb_i7_unmask_int(u32 normal_mask, u32 error_mask)

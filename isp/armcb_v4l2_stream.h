@@ -103,6 +103,7 @@ int armcb_v4l2_stream_init(armcb_v4l2_stream_t **ppstream, int stream_id,
 int armcb_v4l2_stream_on(armcb_v4l2_stream_t *pstream);
 int armcb_v4l2_stream_get_format(armcb_v4l2_stream_t *pstream,
 				 struct v4l2_format *f);
+void armcb_v4l2_stream_clear_buffer_lists(armcb_v4l2_stream_t *pstream);
 void armcb_v4l2_stream_buffer_list_release(armcb_v4l2_stream_t *pstream,
                  struct list_head *stream_buffer_list);
 #endif

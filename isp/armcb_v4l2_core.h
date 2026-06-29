@@ -107,7 +107,13 @@ typedef struct armcb_v4l2_dev {
 	int s_fmt_done;
 	int streamon_done;
 	int streamoff_done;
+	int online_mode;
 	atomic_t daemon_exit;
+
+	/* Set when s_ctrl(STREAM_OFF) path did vb2_queue_release; cleared in fh_release.
+	 * Used so fh_release can skip release when vdev->queue==NULL (already released)
+	 * and still release when vdev->queue wrongly null (avoid leak). */
+	int queue_released_by_s_ctrl;
 } armcb_v4l2_dev_t;
 
 struct armcb_v4l_dev_info {
@@ -135,6 +141,11 @@ struct isp_v4l2_fmt {
 	u8 depth[MAX_PLANES];
 	u16 mdataplanes;
 	u16 flags;
+};
+
+enum on_offline_mode {
+	OFFLINE_MODE = 0,
+	ONLINE_MODE,
 };
 
 typedef enum {

@@ -856,10 +856,7 @@ int armcb_isp_hw_apply(struct cmd_buf *cmd, void *client)
 	if (ret < 0 && cmd->cmd_type != CMD_TYPE_PROBE) {
 		LOG(LOG_ERR, "hw bus:%d type:%d action failed ret:%d! ",
 		    cmd->static_info.bus, cmd->cmd_type, ret);
-		kfree(p_isp_hw_cmd_buf->cmd);
-		p_isp_hw_cmd_buf->cmd = NULL;
-		kfree(p_isp_hw_cmd_buf);
-		p_isp_hw_cmd_buf = NULL;
+		return ret;
 	}
 
 	return ret;

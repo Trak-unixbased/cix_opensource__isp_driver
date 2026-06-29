@@ -21,6 +21,7 @@ armcb_isp_v4l2-objs = sensor/armcb_sensor.o \
 					isp/armcb_isp_driver.o \
 					isp/armcb_v4l2_config.o \
 					isp/armcb_v4l2_core.o \
+					isp/armcb_isp_execstart.o \
 					sensor/actuator/armcb_actuator.o \
 					common/isp_hw_if/isp_hw_ops.o \
 					common/isp_hw_if/isp_hw_utils.o \

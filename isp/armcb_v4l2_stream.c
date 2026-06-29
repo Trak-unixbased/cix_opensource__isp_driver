@@ -187,6 +187,30 @@ int armcb_v4l2_stream_init(armcb_v4l2_stream_t **ppstream, int stream_id,
 	return 0;
 }
 
+/**
+ * armcb_v4l2_stream_clear_buffer_lists - Clear stream buffer lists without
+ * completing buffers. Call only after vb2_streamoff has already completed
+ * buffers (e.g. to avoid double vb2_buffer_done). Caller must hold
+ * appropriate lock (e.g. queue_lock).
+ */
+void armcb_v4l2_stream_clear_buffer_lists(armcb_v4l2_stream_t *pstream)
+{
+	armcb_v4l2_buffer_t *pbuf;
+
+	if (!pstream)
+		return;
+	while (!list_empty(&pstream->stream_buffer_list)) {
+		pbuf = list_first_entry(&pstream->stream_buffer_list,
+					armcb_v4l2_buffer_t, list);
+		list_del(&pbuf->list);
+	}
+	while (!list_empty(&pstream->stream_buffer_list_busy)) {
+		pbuf = list_first_entry(&pstream->stream_buffer_list_busy,
+					armcb_v4l2_buffer_t, list);
+		list_del(&pbuf->list);
+	}
+}
+
 void
 armcb_v4l2_stream_buffer_list_release(armcb_v4l2_stream_t *pstream,
 				      struct list_head *stream_buffer_list)
@@ -226,9 +250,12 @@ void armcb_v4l2_stream_deinit(armcb_v4l2_stream_t *pstream,
 	/* stop hardware do stream-off first if it's on */
 	armcb_v4l2_stream_off(pstream, dev);
 
-	/* release fw_info */
+	/* release buffer lists */
+	armcb_v4l2_stream_buffer_list_release(pstream, &pstream->stream_buffer_list);
+	armcb_v4l2_stream_buffer_list_release(pstream, &pstream->stream_buffer_list_busy);
+
+	/* release stream structure */
 	kfree(pstream);
-	pstream = NULL;
 }
 
 int armcb_v4l2_stream_on(armcb_v4l2_stream_t *pstream)

@@ -14,6 +14,7 @@
  */
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/sched.h>
 #include <linux/v4l2-dv-timings.h>
 #include <linux/videodev2.h>
@@ -29,6 +30,7 @@
 #include "armcb_vb2.h"
 #include "system_logger.h"
 #include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-core.h>
 
 #ifdef LOG_MODULE
 #undef LOG_MODULE
@@ -154,12 +156,44 @@ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 
 static void cap_vb2_stop_streaming(struct vb2_queue *q)
 {
+	armcb_v4l2_dev_t *dev = container_of(q, armcb_v4l2_dev_t, vb2_q);
 	armcb_v4l2_stream_t *pstream = vb2_get_drv_priv(q);
+	armcb_v4l2_buffer_t *pbuf = NULL;
+	unsigned long flags;
+	unsigned int i;
+
 	LOG(LOG_INFO, "function enter");
+	/* Return all driver-held buffers to vb2 so owned_by_drv_count becomes 0.
+	 * Otherwise __vb2_queue_cancel() triggers WARN_ON(owned_by_drv_count). */
+	spin_lock_irqsave(&pstream->slock, flags);
+	//to avoid smmu err
+	if (dev)
+		armcb_v4l2_config_init_update_stream_hw_addr(dev);
+	while (!list_empty(&pstream->stream_buffer_list)) {
+		pbuf = list_entry(pstream->stream_buffer_list.next,
+				  armcb_v4l2_buffer_t, list);
+		list_del(&pbuf->list);
+		vb2_buffer_done(&pbuf->vvb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+	while (!list_empty(&pstream->stream_buffer_list_busy)) {
+		pbuf = list_entry(pstream->stream_buffer_list_busy.next,
+				  armcb_v4l2_buffer_t, list);
+		list_del(&pbuf->list);
+		vb2_buffer_done(&pbuf->vvb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&pstream->slock, flags);
+
+	/* Fallback: return any queue buffer still ACTIVE (e.g. not in our lists).
+	 * Matches kernel __vb2_queue_cancel fallback so owned_by_drv_count is 0. */
+	for (i = 0; i < q->num_buffers; i++) {
+		struct vb2_buffer *vb = q->bufs[i];
+
+		if (vb && vb->state == VB2_BUF_STATE_ACTIVE)
+			vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+	}
+
 	pstream->stream_started = 0;
 	LOG(LOG_INFO, "function exit");
-
-	return;
 }
 
 static struct vb2_ops armcb_vid_cap_qops = {
