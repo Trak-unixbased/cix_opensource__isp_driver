@@ -1,0 +1,5 @@
+armcb-isp-v4l2-dkms (1.0.0) UNRELEASED; urgency=medium
+
+  * Initial DKMS packaging of the CIX ISP V4L2 driver.
+
+ -- ISP Driver Maintainer <maintainer@example.com>  Wed, 17 Jun 2026 00:00:00 +0000

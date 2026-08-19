@@ -1,0 +1,20 @@
+#!/bin/sh
+# prerm — remove the module from DKMS before the source tree is deleted.
+set -e
+
+DKMS_NAME=armcb-isp-v4l2
+DKMS_VER=1.0.0
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if dkms status -m $DKMS_NAME -v $DKMS_VER 2>/dev/null | grep -q .; then
+            dkms remove -m $DKMS_NAME -v $DKMS_VER --all || true
+        fi
+        ;;
+    failed-upgrade)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -50,7 +50,6 @@
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-vmalloc.h>
-#include <linux/soc/cix/rdr_pub.h>
 #include <linux/ktime.h>
 #include <linux/soc/cix/cix_ddr_lp.h>
 
@@ -1658,8 +1657,16 @@ static int armcb_v4l2_s_ctrl(struct file *file, void *fh,
 				}
 				atomic_set(&dev->stream_on_cnt, STREAM_ON);
 			} else if (armcb_multi_cam) {
-				/* Multi-cam only: offline ctx wakes GStreamer without touching all VOUTs */
-				rc = 0;
+				if (!strcmp(vdev->name, "armcb-00-vid-cap")) {
+					/* Multi-cam ctx1 preview: legacy offline STREAMON for DDR feed */
+					armcb_v4l2_config_init_update_stream_hw_addr(dev);
+					rc = armcb_isp_hw_apply_list(CMD_TYPE_STREAMON);
+					if (rc < 0)
+						LOG(LOG_ERR, "armcb_isp_hw_apply_list failed ret(%d)", rc);
+				} else {
+					/* Multi-cam only: offline ctx wakes GStreamer without touching all VOUTs */
+					rc = 0;
+				}
 				atomic_set(&dev->stream_on_cnt, STREAM_ON);
 			} else {
 				/* Single-cam: preserve legacy offline STREAMON path */

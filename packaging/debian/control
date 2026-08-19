@@ -1,0 +1,18 @@
+Source: armcb-isp-v4l2-dkms
+Maintainer: ISP Driver Maintainer <maintainer@example.com>
+Section: kernel
+Priority: optional
+Standards-Version: 4.5.1
+Build-Depends: debhelper-compat (= 12), rsync
+
+Package: armcb-isp-v4l2-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms (>= 2.1.0.0)
+Recommends: build-essential, linux-headers-generic | linux-headers-arm64
+Description: ARM Cambricon ISP V4L2 driver (DKMS source)
+ V4L2 driver for the CIX SoC ISP / camera subsystem (armcb_isp_v4l2.ko).
+ .
+ This package ships only source code — DKMS compiles the module on the
+ target board against the running kernel, and rebuilds automatically on
+ kernel upgrade. Although architecture-independent, the source itself
+ only supports aarch64 + CIX SoC at runtime.
